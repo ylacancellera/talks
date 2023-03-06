@@ -1,0 +1,537 @@
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////            SETUP                //////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+./anydbver deploy pg:14
+./anydbver ssh
+yum install -y vim less git wget bzip2
+git clone https://github.com/credativ/omdb-postgresql.git
+cd omdb-postgresql
+./download 
+./import 
+su - postgres 
+psql omdb
+
+create index on categories (name);
+create index on movie_categories(category_id);
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////          CONTEXT                //////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+\d+ movies
+\d+ movie_categories
+\d+ categories
+
+// We'll choose some movie
+SELECT id, name FROM movies WHERE id = 77;
+ id |  name   
+----+---------
+ 77 | Memento
+(1 row)
+
+// It has 18 categories
+SELECT * FROM movie_categories WHERE movie_id = 77;
+ movie_id | category_id 
+----------+-------------
+       77 |          49
+       77 |          79
+       77 |          80
+       77 |         134
+       77 |         141
+       77 |         219
+       77 |         301
+       77 |         303
+       77 |         329
+       77 |         684
+       77 |        1086
+       77 |        4865
+       77 |       10214
+       77 |       10215
+       77 |       10222
+       77 |       10225
+       77 |       10228
+       77 |       10282
+(18 rows)
+
+
+// What are those categories ?
+SELECT c.name, c.parent_id FROM movie_categories mc JOIN categories c ON mc.category_id=c.id WHERE movie_id = 77;
+            name             | parent_id 
+-----------------------------+-----------
+ Cult Favorite               |         4
+ Mysterie                    |        53
+ Crime                       |         1
+ Justice Drama               |        18
+ Psychological Thriller      |        53
+ Psychodrama                 |        18
+ Black And White Film        |        10
+ Independent Film            |         7
+ Backflash                   |      1030
+ Non-linear Timeline         |      1030
+ neo-noir                    |      1080
+ Slow Motion                 |      1057
+ Exciting                    |     10213
+ Emotionen > Spannend        |     10213
+ Intellectually Stimulating  |     10213
+ Bleak                       |     10213
+ Goofy                       |     10213
+ Nominated for Academy Award |         4
+(18 rows)
+
+
+// We have parent categories
+// Now try to fetch categories AND their parent categories 
+//
+WITH RECURSIVE cte_cs AS (
+		SELECT c.name, c.id, c.parent_id, c.root_id 
+		FROM movie_categories mc 
+		JOIN categories c ON mc.category_id=c.id 
+		WHERE movie_id = 77 
+	UNION 
+		SELECT c2.name, c2.id, c2.parent_id, c2.root_id 
+		FROM categories c2 
+		JOIN cte_cs on cte_cs.parent_id=c2.id
+) 
+SELECT name, id, parent_id 
+FROM cte_cs 
+ORDER BY id, parent_id;
+            name             |  id   | parent_id 
+-----------------------------+-------+-----------
+ Genre                       |     1 |          
+ Standing                    |     4 |          
+ Filmmaking Movement         |     6 |          
+ Production                  |     7 |          
+ Term                        |     9 |          
+ Technical Format            |    10 |         9
+ Drama                       |    18 |         1
+ Cult Favorite               |    49 |         4
+ Thriller                    |    53 |         1
+ Mysterie                    |    79 |        53
+ Crime                       |    80 |         1
+ Justice Drama               |   134 |        18
+ Psychological Thriller      |   141 |        53
+ Psychodrama                 |   219 |        18
+ Black And White Film        |   301 |        10
+ Independent Film            |   303 |         7
+ Backflash                   |   329 |      1030
+ Non-linear Timeline         |   684 |      1030
+ Time in Film                |  1030 |         9
+ Post Production             |  1056 |         9
+ Visual Effects (VFX)        |  1057 |      1056
+ US-American Cinema          |  1080 |      3277
+ neo-noir                    |  1086 |      1080
+ North American Cinema       |  3277 |         6
+ Slow Motion                 |  4865 |      1057
+ Emotions                    | 10213 |         9
+ Exciting                    | 10214 |     10213
+ Emotionen > Spannend        | 10215 |     10213
+ Intellectually Stimulating  | 10222 |     10213
+ Bleak                       | 10225 |     10213
+ Goofy                       | 10228 |     10213
+ Nominated for Academy Award | 10282 |         4
+(32 rows)
+
+// we have more results, and important ones like 'thriller'
+
+
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////          PROBLEM                //////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+// Now, how to find movies with Thiller + Justice Drama + Nominated for Academy Award ?
+
+
+// naive join wouldn't work
+SELECT m.name 
+FROM movies m 
+JOIN movie_categories mc ON m.id = mc.movie_id 
+JOIN categories c ON mc.category_id=c.id 
+WHERE c.name IN ('Thriller', 'Justice Drama', 'Nominated for Academy Award') 
+GROUP BY 1 HAVING count(c.name)=3;
+
+         name          
+------------------------
+ Blackout
+ Collateral
+ Conviction
+ Flatliners
+ Ground Zero
+ Hunger
+ Hush
+ Kojak
+ Les misérables
+ Melissa
+ Michael Clayton
+ Money
+ Paranoia
+ Ransom
+ Rear Window
+ RoboCop
+ Season 3
+ Season 4
+ Season 5
+ Sleuth
+ Straw Dogs
+ The Firm
+ The French Connection
+ The Godfather Part III
+ The Letter
+ The Reckoning
+ Traffic
+ Venom
+// => NO memento
+
+
+
+// We have to use RECURSIVE CTE + a GROUP BY trick
+WITH RECURSIVE cte_cs as (
+		SELECT c.id, c.id AS group, c.name 
+		FROM categories c 
+		WHERE c.name IN ('Thriller', 'Nominated for Academy Award', 'Justice Drama') 
+	UNION 
+		SELECT c2.id, cte_cs.id AS group, c2.name 
+		FROM categories c2 
+		JOIN cte_cs ON cte_cs.id = c2.parent_id
+) 
+SELECT m.id, m.name, string_agg(cte_cs.name, ',') 
+FROM movies m 
+JOIN movie_categories mc ON m.id = mc.movie_id 
+JOIN cte_cs ON cte_cs.id = mc.category_id 
+GROUP BY 1, 2 
+HAVING count(distinct cte_cs.group) = 3;
+
+  id   |            name             |                                    string_agg                                    
+-------+-----------------------------+----------------------------------------------------------------------------------
+    77 | Memento                     | Mysterie,Justice Drama,Nominated for Academy Award,Psychological Thriller
+   180 | Minority Report             | Justice Drama,Nominated for Academy Award,Political Thriller
+   240 | The Godfather Part II       | Justice Drama,Conspiracy Thriller,Nominated for Academy Award
+   242 | The Godfather Part III      | Nominated for Academy Award,Thriller,Justice Drama
+   334 | Magnolia                    | Nominated for Academy Award,Psychological Thriller,Justice Drama
+   729 | The Firm                    | Thriller,Justice Drama,Nominated for Academy Award
+   737 | Witness for the Prosecution | Thriller,Courtroom Drama,Nominated for Academy Award
+  1051 | The French Connection       | Justice Drama,Nominated for Academy Award,Thriller
+  1538 | Collateral                  | Thriller,Justice Drama,Psychological Thriller,Nominated for Academy Award
+  3580 | Changeling                  | Justice Drama,Conspiracy Thriller,Courtroom Drama,Nominated for Academy Award
+  4566 | Michael Clayton             | Nominated for Academy Award,Thriller,Justice Drama
+  9008 | The Insider                 | Justice Drama,Nominated for Academy Award,Conspiracy Thriller,Political Thriller
+ 61650 | The Letter                  | Thriller,Nominated for Academy Award,Courtroom Drama
+(13 rows)
+
+// some are here because of subcategories ('Courtroom Drama', subcategory of 'Justice Drama' for example)
+
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////          ARRAY                //////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+// Now, how we could aggregate all that stuff into arrays using array_agg.
+
+WITH RECURSIVE cte_cs AS (
+		SELECT mc.movie_id, c.id, c.name, c.parent_id 
+		FROM movie_categories mc 
+		JOIN categories c on mc.category_id=c.id 
+	UNION 
+		SELECT cte_cs.movie_id, c2.id, c2.name, c2.parent_id 
+		FROM categories c2 
+		JOIN cte_cs ON cte_cs.parent_id=c2.id
+), cte_arr AS (
+	SELECT movie_id, array_agg(name) 
+	FROM cte_cs 
+	GROUP BY 1
+) 
+SELECT cte_arr.movie_id, movies.name, cte_arr.array_agg 
+FROM cte_arr 
+JOIN movies ON cte_arr.movie_id=movies.id 
+ORDER BY movie_id LIMIT 5 OFFSET 51;
+
+ movie_id |        name        | array_agg 
+------------------------------------------------------------------------------------------------------------
+       73 | American History X | {"Social Drama",Crime,Violence,"US-American Cinema",Ernst,Bleak,Disquieting,"Nominated for Academy Award",Drama,Genre,Adult,"North American Cinema",Emotions,Standing,Audience,"Filmmaking Movement",Term}
+       74 | War of the Worlds  | {Familienfilm,"Hollywood Film","Apocalypse & Post-Apocalypse","Family Drama",Blockbuster,"Disaster Film",Novel,"US-American Cinema","Popcorn Movie",Mainstream,Remake,Audience,Production,Sci-Fi,Drama,Standing,Genre,"Literary Fiction","North American Cinema",Source,"Filmmaking Movement"}
+       75 | Mars Attacks!      | {"Black Comedy",Satire,"Multiple Roles",Cameo,Sci-Fi,"US-American Cinema","Popcorn Movie",Mainstream,Hommage,35-mm,"Actors Playing Themselves",Funny,Feel-good,"Intellectually Stimulating",Goofy,Comedy,Actors,"Guest Appearance",Genre,"North American Cinema",Standing,Class,"Filming Material",Emotions,Characters,"Filmmaking Movement","Technical Format",Term}
+       76 | Before Sunrise     | {"Romance Film","Low Budget Film","Romantic Comedy","Independent Film","Chick Flick",Romantic,Berührend,"Intellectually Stimulating","Romantic Drama",Production,Comedy,Audience,Emotions,Drama,Genre,Term}
+       77 | Memento            | {"Cult Favorite",Mysterie,Crime,"Justice Drama","Psychological Thriller",Psychodrama,"Black And White Film","Independent Film",Backflash,"Non-linear Timeline",neo-noir,"Slow Motion",Exciting,"Emotionen > Spannend","Intellectually Stimulating",Bleak,Goofy,"Nominated for Academy Award",Standing,Thriller,Genre,Drama,"Technical Format",Production,"Time in Film","US-American Cinema","Visual Effects (VFX)",Emotions,Term,"North American Cinema","Post Production","Filmmaking Movement"}
+(5 rows)
+
+
+///////////////////////////////////
+///// New movies table !  ////////
+/////////////////////////////////
+
+// Copy table
+create table movies_array (like movies including all);
+insert into movies_array select * from movies;
+
+// Add THE column 
+// not text[], because it would stored in toast table which would be a bad idea to actually implement 
+alter table movies_array add column categories varchar(64)[];
+
+
+// Now writing an array of each categories
+BEGIN;
+
+WITH RECURSIVE cte_cs AS (
+	SELECT mc.movie_id, c.id, c.name, c.parent_id 
+	FROM movie_categories mc 
+	JOIN categories c ON mc.category_id=c.id 
+	UNION 
+	SELECT cte_cs.movie_id, c2.id, c2.name, c2.parent_id 
+	FROM categories c2 JOIN cte_cs ON cte_cs.parent_id=c2.id
+), cte_arr AS (
+	SELECT movie_id, array_agg(name) as array 
+	FROM cte_cs 
+	GROUP BY 1
+) 
+UPDATE movies_array mar 
+SET categories=cte_arr.array 
+FROM cte_arr 
+WHERE cte_arr.movie_id=mar.id;
+
+// Checking
+select id, name, categories from movies_array order by id;
+
+COMMIT;
+
+// Using GIN already
+CREATE INDEX ON movies_array USING GIN (categories);
+ANALYZE movies_array;
+
+
+///////////////////////////////////
+///////// Now using it  //////////
+/////////////////////////////////
+
+// now fetching film with multiple categories
+SELECT id, name 
+FROM movies_array 
+WHERE categories @> '{"Thriller"}'::varchar(64)[] 
+	AND categories @> '{"Nominated for Academy Award"}'::varchar(64)[] 
+	AND categories @> '{"Justice Drama"}'::varchar(64)[] 
+ORDER BY id;
+
+  id   |            name             
+-------+-----------------------------
+    77 | Memento
+   180 | Minority Report
+   240 | The Godfather Part II
+   242 | The Godfather Part III
+   334 | Magnolia
+   729 | The Firm
+   737 | Witness for the Prosecution
+  1051 | The French Connection
+  1538 | Collateral
+  3580 | Changeling
+  4566 | Michael Clayton
+  9008 | The Insider
+ 61650 | The Letter
+(13 rows)
+
+// Can be simplified with
+SELECT id, name 
+FROM movies_array 
+WHERE categories @> '{"Justice Drama", "Nominated for Academy Award", "Thriller"}'::varchar(64)[] 
+ORDER BY id;                                                                     
+
+
+
+// we can even search "related" movies, by varying how many categories we filter on
+SELECT id, name FROM movies_array WHERE categories && '{"Bleak","Justice Drama"}'::varchar(64)[] ORDER BY id;
+
+
+
+// And it's still straightforward to know that some films do not have categories
+SELECT id, name FROM movies_array WHERE categories IS NULL;
+
+
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////          LTREE                //////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+///////////////////////////////////
+/////// New category table ///////
+/////////////////////////////////
+
+CREATE EXTENSION ltree;
+
+CREATE TABLE categories_ltree (like categories including all);
+INSERT INTO categories_ltree SELECT * FROM categories;
+ALTER TABLE categories_ltree ADD COLUMN name_sanitized text;
+ALTER TABLE categories_ltree ADD COLUMN name_tree ltree;
+
+
+///////////////////////////////////
+//// Sanitizing category name ////
+/////////////////////////////////
+
+// ltree is not compatible because of symbols:
+select id, name, text2ltree(name) from categories_ltree order by id;                                                                                                                     
+select text2ltree('Apocalypse & Post-Apocalypse');
+ERROR:  ltree syntax error at character 11
+
+
+
+SELECT name, regexp_matches(name, '[a-zA-Z0-9_]+', 'g') FROM categories;
+
+SELECT name, unnest(match), sort_order 
+FROM categories, 
+	regexp_matches(name, '(\w+)', 'g') WITH ORDINALITY as f (match, sort_order);
+
+SELECT name, string_agg(word, '_') 
+FROM (
+	select name, unnest(match) as word, sort_order 
+	FROM categories, 
+		regexp_matches(name, '(\w+)', 'g') WITH ORDINALITY as f (match, sort_order) 
+	ORDER BY name, sort_order
+) f 
+GROUP BY name;
+
+
+// Now sanitizing every names 
+//
+WITH cte_sanitized AS (
+	SELECT id, string_agg(word, '_') as name 
+	FROM (
+		SELECT id, unnest(match) as word, sort_order 
+		FROM  categories, 
+			regexp_matches(name, '(\w+)', 'g') WITH ORDINALITY as f (match, sort_order) 
+		ORDER BY id, sort_order
+	) f 
+	GROUP BY id
+) 
+UPDATE categories_ltree ctg_ltree 
+SET name_sanitized=cte_sanitized.name 
+FROM cte_sanitized 
+WHERE cte_sanitized.id=ctg_ltree.id;
+
+// ltree is now compatible
+select id, name, name_sanitized, text2ltree(name_sanitized) from categories_ltree order by id;
+
+
+
+///////////////////////////////////
+/////// Ltree categories  ////////
+/////////////////////////////////
+
+// Setting proper tree on categories
+
+WITH RECURSIVE cte_tree AS (
+		SELECT c.id, c.name_sanitized as tree, c.parent_id 
+		FROM categories_ltree c 
+		WHERE c.parent_id is null 
+	UNION 
+		select c2.id, 
+			cte_tree.tree || '.' || c2.name_sanitized as tree, 
+			c2.parent_id 
+		FROM categories_ltree c2 
+		JOIN cte_tree ON cte_tree.id=c2.parent_id
+) 
+UPDATE categories_ltree ctg_ltree 
+SET name_tree = text2ltree(tree) 
+FROM cte_tree 
+WHERE cte_tree.id = ctg_ltree.id ;
+
+// why wait
+CREATE INDEX on categories_ltree USING GIST (name_tree);
+ANALYZE categories_ltree;
+
+
+// Few examples of LTREE 
+ SELECT * from categories_ltree WHERE name_tree @ 'Justice_Drama | Thriller | Nominated_for_Academy_Award'; 
+  id   | parent_id | root_id |            name             |       name_sanitized        |                    name_tree                     
+-------+-----------+---------+-----------------------------+-----------------------------+--------------------------------------------------
+ 10282 |         4 |       4 | Nominated for Academy Award | Nominated_for_Academy_Award | Standing.Nominated_for_Academy_Award
+   142 |        53 |       1 | Erotic Thriller             | Erotic_Thriller             | Genre.Thriller.Erotic_Thriller
+ 16286 |        53 |       1 | Giallo                      | Giallo                      | Genre.Thriller.Giallo
+   106 |        53 |       1 | Political Thriller          | Political_Thriller          | Genre.Thriller.Political_Thriller
+   141 |        53 |       1 | Psychological Thriller      | Psychological_Thriller      | Genre.Thriller.Psychological_Thriller
+    53 |         1 |       1 | Thriller                    | Thriller                    | Genre.Thriller
+    76 |        53 |       1 | Conspiracy Thriller         | Conspiracy_Thriller         | Genre.Thriller.Conspiracy_Thriller
+    79 |        53 |       1 | Mysterie                    | Mysterie                    | Genre.Thriller.Mysterie
+ 15176 |     13200 |       8 | Thriller                    | Thriller                    | Keyword.Plot.Arts_and_Culture.Film.Film.Thriller
+   134 |        18 |       1 | Justice Drama               | Justice_Drama               | Genre.Drama.Justice_Drama
+   135 |       134 |       1 | Courtroom Drama             | Courtroom_Drama             | Genre.Drama.Justice_Drama.Courtroom_Drama
+(11 rows)
+
+
+
+///////////////////////////////////
+/// Adding LTREEs into movies  ///
+/////////////////////////////////
+
+// new table again
+CREATE TABLE movies_arrayltree (like movies including all);
+INSERT INTO movies_arrayltree select * from movies;
+ALTER TABLE movies_arrayltree add column categories ltree[];
+
+WITH cte_cs AS (
+	SELECT mc.movie_id, c.name_tree as name_tree 
+	FROM movie_categories mc 
+	JOIN categories_ltree c ON mc.category_id=c.id
+), cte_arr AS (
+	SELECT movie_id, array_agg(cte_cs.name_tree) as array 
+	FROM cte_cs 
+	GROUP BY 1
+) 
+UPDATE movies_arrayltree mar SET categories=cte_arr.array 
+FROM cte_arr 
+WHERE cte_arr.movie_id=mar.id;
+
+CREATE INDEX on movies_arrayltree USING GIST (categories);         
+ANALYZE movies_arrayltree;
+
+
+// now using it!
+SELECT id, name 
+FROM movies_arrayltree 
+WHERE categories @ 'Justice_Drama' 
+	AND categories @ 'Nominated_for_Academy_Award' 
+	AND categories @ 'Thriller' 
+ORDER BY id; 
+
+  id   |            name             
+-------+-----------------------------
+    77 | Memento
+   180 | Minority Report
+   240 | The Godfather Part II
+   242 | The Godfather Part III
+   334 | Magnolia
+   729 | The Firm
+   737 | Witness for the Prosecution
+  1051 | The French Connection
+  1538 | Collateral
+  3580 | Changeling
+  4566 | Michael Clayton
+  9008 | The Insider
+ 61650 | The Letter
+(13 rows)
+
+
+// Now we even have advanced search
+SELECT id, name                                                                                         
+FROM movies_arrayltree                                                                                  
+WHERE categories @ 'Justice_Drama & !Courtroom_Drama'
+    AND categories @ 'Nominated_for_Academy_Award'                                                      
+    AND categories @ 'Thriller & !Conspiracy_Thriller & !Political_Thriller'
+ORDER BY id;    
+
+  id  |          name          
+------+------------------------
+   77 | Memento
+  242 | The Godfather Part III
+  334 | Magnolia
+  729 | The Firm
+ 1051 | The French Connection
+ 1538 | Collateral
+ 4566 | Michael Clayton
+(7 rows)
+
