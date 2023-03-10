@@ -15,6 +15,8 @@ psql omdb
 create index on categories (name);
 create index on movie_categories(category_id);
 
+\pset pager 0
+
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////          CONTEXT                //////////////////////////////////////////////
@@ -278,12 +280,12 @@ alter table movies_array add column categories varchar(64)[];
 BEGIN;
 
 WITH RECURSIVE cte_cs AS (
-	SELECT mc.movie_id, c.id, c.name, c.parent_id 
-	FROM movie_categories mc 
-	JOIN categories c ON mc.category_id=c.id 
+		SELECT mc.movie_id, c.id, c.name, c.parent_id 
+		FROM movie_categories mc 
+		JOIN categories c ON mc.category_id=c.id 
 	UNION 
-	SELECT cte_cs.movie_id, c2.id, c2.name, c2.parent_id 
-	FROM categories c2 JOIN cte_cs ON cte_cs.parent_id=c2.id
+		SELECT cte_cs.movie_id, c2.id, c2.name, c2.parent_id 
+		FROM categories c2 JOIN cte_cs ON cte_cs.parent_id=c2.id
 ), cte_arr AS (
 	SELECT movie_id, array_agg(name) as array 
 	FROM cte_cs 
@@ -414,7 +416,7 @@ FROM cte_sanitized
 WHERE cte_sanitized.id=ctg_ltree.id;
 
 // ltree is now compatible
-select id, name, name_sanitized, text2ltree(name_sanitized) from categories_ltree order by id;
+select id, name, name_sanitized, text2ltree(name_sanitized) from categories_ltree order by id limit 10;
 
 
 

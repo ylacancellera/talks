@@ -1,0 +1,283 @@
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////            SETUP                //////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+./anydbver deploy pg:14
+./anydbver ssh
+yum install -y vim less git wget bzip2
+git clone https://github.com/credativ/omdb-postgresql.git
+cd omdb-postgresql
+./download 
+./import 
+su - postgres 
+psql omdb
+
+create index on categories (name);
+create index on movie_categories(category_id);
+
+\pset pager 0
+
+
+
+CREATE EXTENSION ltree;
+
+CREATE TABLE categories_ltree (like categories including all);
+INSERT INTO categories_ltree SELECT * FROM categories;
+ALTER TABLE categories_ltree ADD COLUMN name_tree ltree;
+ALTER TABLE categories_ltree ADD COLUMN name_sanitized text;
+
+
+
+// why wait
+CREATE INDEX on categories_ltree USING GIST (name_tree);
+ANALYZE categories_ltree;
+
+///////////////////////////////////
+//// Sanitizing category name ////
+/////////////////////////////////
+
+WITH cte_sanitized AS (
+	SELECT id, string_agg(word, '_') as name 
+	FROM (
+		SELECT id, unnest(match) as word, sort_order 
+		FROM  categories, 
+			regexp_matches(name, '(\w+)', 'g') WITH ORDINALITY as f (match, sort_order) 
+		ORDER BY id, sort_order
+	) f 
+	GROUP BY id
+) 
+UPDATE categories_ltree ctg_ltree 
+SET name_sanitized=cte_sanitized.name 
+FROM cte_sanitized 
+WHERE cte_sanitized.id=ctg_ltree.id;
+
+
+WITH RECURSIVE cte_tree AS (
+		SELECT c.id, c.name_sanitized as tree, c.parent_id 
+		FROM categories_ltree c 
+		WHERE c.parent_id is null 
+	UNION 
+		select c2.id, 
+			cte_tree.tree || '.' || c2.name_sanitized as tree, 
+			c2.parent_id 
+		FROM categories_ltree c2 
+		JOIN cte_tree ON cte_tree.id=c2.parent_id
+) 
+UPDATE categories_ltree ctg_ltree 
+SET name_tree = text2ltree(tree) 
+FROM cte_tree 
+WHERE cte_tree.id = ctg_ltree.id ;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////          CONTEXT                //////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+// We'll choose some movie
+SELECT id, name FROM movies WHERE id = 77;
+
+// It has 18 categories
+SELECT * FROM movie_categories WHERE movie_id = 77;
+
+
+// What are those categories ?
+SELECT c.name, c.parent_id FROM movie_categories mc JOIN categories c ON mc.category_id=c.id WHERE movie_id = 77;
+
+
+//////////// PPT
+
+// We have parent categories
+// Now try to fetch categories AND their parent categories 
+
+WITH RECURSIVE cte_cs AS (
+		SELECT c.name, c.id, c.parent_id, c.root_id 
+		FROM movie_categories mc 
+		JOIN categories c ON mc.category_id=c.id 
+		WHERE movie_id = 77 
+	UNION 
+		SELECT c2.name, c2.id, c2.parent_id, c2.root_id 
+		FROM categories c2 
+		JOIN cte_cs on cte_cs.parent_id=c2.id
+) 
+SELECT name, id, parent_id 
+FROM cte_cs 
+ORDER BY id, parent_id;
+
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////          PROBLEM                //////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+// Now, how to find movies with Thiller + Justice Drama + Nominated for Academy Award ?
+
+// naive join wouldn't work
+
+SELECT m.name 
+FROM movies m 
+JOIN movie_categories mc ON m.id = mc.movie_id 
+JOIN categories c ON mc.category_id=c.id 
+WHERE c.name IN ('Thriller', 'Justice Drama', 'Nominated for Academy Award') 
+GROUP BY 1 HAVING count(c.name)=3;
+
+
+
+// We have to use RECURSIVE CTE + a GROUP BY trick
+
+WITH RECURSIVE cte_cs as (
+		SELECT c.id, c.id AS group, c.name 
+		FROM categories c 
+		WHERE c.name IN ('Thriller', 'Nominated for Academy Award', 'Justice Drama') 
+	UNION 
+		SELECT c2.id, cte_cs.id AS group, c2.name 
+		FROM categories c2 
+		JOIN cte_cs ON cte_cs.id = c2.parent_id
+) 
+SELECT m.id, m.name, string_agg(cte_cs.name, ',') 
+FROM movies m 
+JOIN movie_categories mc ON m.id = mc.movie_id 
+JOIN cte_cs ON cte_cs.id = mc.category_id 
+GROUP BY 1, 2 
+HAVING count(distinct cte_cs.group) = 3;
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////          ARRAY                //////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+// Now, how we could aggregate all that stuff into arrays using array_agg.
+
+WITH RECURSIVE cte_cs AS (
+		SELECT mc.movie_id, c.id, c.name, c.parent_id 
+		FROM movie_categories mc 
+		JOIN categories c on mc.category_id=c.id 
+	UNION 
+		SELECT cte_cs.movie_id, c2.id, c2.name, c2.parent_id 
+		FROM categories c2 
+		JOIN cte_cs ON cte_cs.parent_id=c2.id
+), cte_arr AS (
+	SELECT movie_id, array_agg(name) 
+	FROM cte_cs 
+	GROUP BY 1
+) 
+SELECT cte_arr.movie_id, movies.name, cte_arr.array_agg 
+FROM cte_arr 
+JOIN movies ON cte_arr.movie_id=movies.id 
+ORDER BY movie_id LIMIT 5 OFFSET 51;
+
+
+
+///////////////////////////////////
+///// New movies table !  ////////
+/////////////////////////////////
+
+create table movies_array (like movies including all);
+insert into movies_array select * from movies;
+alter table movies_array add column categories varchar(64)[];
+
+
+// Now writing an array of each categories
+BEGIN;
+
+WITH RECURSIVE cte_cs AS (
+		SELECT mc.movie_id, c.id, c.name, c.parent_id 
+		FROM movie_categories mc 
+		JOIN categories c ON mc.category_id=c.id 
+	UNION 
+		SELECT cte_cs.movie_id, c2.id, c2.name, c2.parent_id 
+		FROM categories c2 JOIN cte_cs ON cte_cs.parent_id=c2.id
+), cte_arr AS (
+	SELECT movie_id, array_agg(name) as array 
+	FROM cte_cs 
+	GROUP BY 1
+) 
+UPDATE movies_array mar 
+SET categories=cte_arr.array 
+FROM cte_arr 
+WHERE cte_arr.movie_id=mar.id;
+
+// Checking
+select id, name, categories from movies_array order by id;
+
+COMMIT;
+
+// Using GIN already
+CREATE INDEX ON movies_array USING GIN (categories);
+ANALYZE movies_array;
+
+//////////// PPT
+
+///////////////////////////////////
+///////// Now using it  //////////
+/////////////////////////////////
+
+SELECT id, name 
+FROM movies_array 
+WHERE categories @> '{"Justice Drama", "Nominated for Academy Award", "Thriller"}'::varchar(64)[] 
+ORDER BY id;                                                                     
+
+
+SELECT id, name FROM movies_array WHERE categories && '{"Bleak","Justice Drama"}'::varchar(64)[] ORDER BY id;
+
+SELECT id, name FROM movies_array WHERE categories IS NULL;
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////          LTREE                //////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+///////////////////////////////////
+/////// Ltree categories  ////////
+/////////////////////////////////
+
+// Setting proper tree on categories
+
+SELECT name, name_tree from categories_ltree WHERE name_tree @ 'Justice_Drama | Thriller | Nominated_for_Academy_Award'; 
+
+
+///////////////////////////////////
+/// Adding LTREEs into movies  ///
+/////////////////////////////////
+
+// new table again
+CREATE TABLE movies_arrayltree (like movies including all);
+INSERT INTO movies_arrayltree select * from movies;
+ALTER TABLE movies_arrayltree add column categories ltree[];
+
+WITH cte_cs AS (
+	SELECT mc.movie_id, c.name_tree as name_tree 
+	FROM movie_categories mc 
+	JOIN categories_ltree c ON mc.category_id=c.id
+), cte_arr AS (
+	SELECT movie_id, array_agg(cte_cs.name_tree) as array 
+	FROM cte_cs 
+	GROUP BY 1
+) 
+UPDATE movies_arrayltree mar SET categories=cte_arr.array 
+FROM cte_arr 
+WHERE cte_arr.movie_id=mar.id;
+
+CREATE INDEX on movies_arrayltree USING GIST (categories);         
+ANALYZE movies_arrayltree;
+
+
+// now using it!
+
+SELECT id, name 
+FROM movies_arrayltree 
+WHERE categories @ 'Justice_Drama' 
+	AND categories @ 'Nominated_for_Academy_Award' 
+	AND categories @ 'Thriller' 
+ORDER BY id; 
+
+
+SELECT id, name                                                                                         
+FROM movies_arrayltree                                                                                  
+WHERE categories @ 'Justice_Drama & !Courtroom_Drama'
+    AND categories @ 'Nominated_for_Academy_Award'                                                      
+    AND categories @ 'Thriller & !Conspiracy_Thriller & !Political_Thriller'
+ORDER BY id;    
+
